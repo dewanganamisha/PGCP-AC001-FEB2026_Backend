@@ -6,10 +6,11 @@ import { ApiError } from "../middleware/error";
 import { asyncHandler } from "../utils/asyncHandler";
 import {
   doctorRegistrationSchema,
+  forgotPasswordSchema,
   loginSchema,
   patientRegistrationSchema,
-  pharmacistRegistrationSchema
-  
+  pharmacistRegistrationSchema,
+  resetPasswordSchema,
 } from "../validators/auth";
 
 export const authRoutes = Router();
@@ -158,6 +159,74 @@ authRoutes.post(
       redirectTo: `/${user.role === "pharmacist" ? "pharmacy" : user.role}/dashboard`,
     });
      }),
+);
+authRoutes.post(
+  "/forgot-password",
+  asyncHandler(async (req, res) => {
+    const body = forgotPasswordSchema.parse(req.body);
+    const user = await prisma.user.findUnique({ where: { email: body.email.toLowerCase() } });
+
+    if (!user) {
+      return res.json({ message: "If the email exists, an OTP has been sent." });
+    }
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    await prisma.passwordResetOtp.create({
+      data: {
+        userId: user.id,
+        otpHash: await hashPassword(otp),
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      },
+    });
+
+    res.json({
+      message: "Password reset OTP generated.",
+      devOtp: process.env.NODE_ENV === "production" ? undefined : otp,
+    });
+  }),
+);
+
+authRoutes.post(
+  "/reset-password",
+  asyncHandler(async (req, res) => {
+    const body = resetPasswordSchema.parse(req.body);
+    const user = await prisma.user.findUnique({ where: { email: body.email.toLowerCase() } });
+    if (!user) throw new ApiError(400, "Invalid or expired OTP");
+
+    const otpRecords = await prisma.passwordResetOtp.findMany({
+      where: {
+        userId: user.id,
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+    });
+
+    const matchingOtp = (
+      await Promise.all(
+        otpRecords.map(async (record) => ({
+          record,
+          matches: await verifyPassword(body.otp, record.otpHash),
+        })),
+      )
+    ).find((item) => item.matches)?.record;
+
+    if (!matchingOtp) throw new ApiError(400, "Invalid or expired OTP");
+
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: await hashPassword(body.password) },
+      }),
+      prisma.passwordResetOtp.update({
+        where: { id: matchingOtp.id },
+        data: { usedAt: new Date() },
+      }),
+    ]);
+
+    res.json({ message: "Password reset successful." });
+  }),
 );
 authRoutes.get(
   "/me",
